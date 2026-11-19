@@ -672,6 +672,7 @@ struct ExpertDispatch {
     /// per layer: the PCIe share fetched there since the tier's last round (the tier leaves those layers' fetchable
     /// candidates to the admission under STRATA_ADAPT_FETCH=2, and swaps the rest itself)
     std::vector<uint8_t> fetch_avail;
+    bool fetch_paused = false;       ///< no in-place admissions while prefill owns cache slots
     int64_t fetch_admitted = 0;
     bool fetch_log_on = false;          ///< STRATA_ADAPT_FETCH_VERIFY: keep the admissions for a read-back
     std::vector<std::pair<int64_t, int32_t>> fetch_log;   ///< (layer * n_expert + expert, slot)

@@ -4787,8 +4787,8 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
 // ================================ THE ADAPTER ================================
 
 bool ExpertDispatch::fetch_can(int64_t layer) const {
-    return fetch_admit > 0 && res_mut != nullptr && !usage.empty() && plan != nullptr && plan->pcie_mode == 2 &&
-           plan->dst2 != nullptr && peer == nullptr && remote_count == 0 && fs == nullptr && pcie_num > 0 &&
+    return fetch_admit > 0 && !fetch_paused && res_mut != nullptr && !usage.empty() && plan != nullptr &&
+           plan->pcie_mode == 2 && plan->dst2 != nullptr && peer == nullptr && remote_count == 0 && fs == nullptr && pcie_num > 0 &&
            src != nullptr && src->pcie_layer(layer);
 }
 

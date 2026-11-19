@@ -407,6 +407,12 @@ Swaps move experts between the GPU and the CPU, which round differently, so gree
 does not adapt by default: its windows count the routing, but no round starts while groups are in flight, so the tier
 moves only when the slots go back to the solo path.
 
+`STRATA_BATCH_ADAPT_FETCH=1` lets the PCIe kernel write an eligible expert straight into a cache slot that the
+current batch window does not use. The next window can reuse the weight, and the admission counts against the
+next adaptive refill budget. It uses the same heat thresholds as `STRATA_ADAPT_FETCH` and pauses while prefill
+can borrow expert slots. Enable it for serial batch on one CUDA GPU with the adaptive tier, a nonzero PCIe share,
+`--pcie-mode kernel` and `STRATA_ADAPT_OVERLAP=0`. Leave it unset to use the regular batch cache policy.
+
 `STRATA_PIPE_ADAPT_EVERY=N` (opt-in; unset or 0 keeps the old behaviour) lets the pipelined path adapt: after N group
 windows it starts no new group, lets the groups in flight finish, runs one round as the serial batch loop does (nothing
 in flight reads a cache slot, and the swapped-in experts land before the next launch), and goes on. It stands still while

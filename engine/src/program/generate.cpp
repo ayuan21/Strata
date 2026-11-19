@@ -14251,20 +14251,36 @@ int main(int argc, char** argv) {
             split_drive_b.pcie_num[0] = drive.d.pcie_num;
         };
         // the serial windows of one GPU, where the pool can admit (expert_pool_dispatch_multi's fetch_on)
+        const char* batch_fetch_env = std::getenv("STRATA_BATCH_ADAPT_FETCH");
+        const bool batch_fetch_requested = o.batch > 0 && batch_fetch_env != nullptr &&
+                                           std::strcmp(batch_fetch_env, "1") == 0;
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+        const char* const batch_fetch_backend_off = batch_fetch_requested ? "requires CUDA" : nullptr;
+#else
+        const char* const batch_fetch_backend_off = nullptr;
+#endif
+        bool batch_fetch_active = false;
         const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
                               : multi_gpu || !stages.empty() ? "a layer split" : peer.valid() ? "--peer-device"
                               : remote_opt || drive.d.remote_count > 0 ? "helper GPUs" : o.adapt_async ? "--adapt-async"
-                              : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch"
+                              : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 && !batch_fetch_requested ? "--batch"
                               : adapt_overlap() ? "STRATA_ADAPT_OVERLAP=1" : nullptr;
-        if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
-            const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
+        if (adapt_fetch() > 0 || batch_fetch_requested) {
+            const char* off = batch_fetch_backend_off != nullptr ? batch_fetch_backend_off
+                            : drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
                             : drive.d.plan == nullptr ? "no GPU plan"
                             : drive.d.pcie_num <= 0 ? "no PCIe share"
                             : src.complement_ready() ? "the resident RAM mode" : nullptr;
-            if (off != nullptr) std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH is off (%s)\n", off);
+            if (off != nullptr)
+                std::fprintf(stderr, "strata serve: %s is off (%s)\n",
+                             batch_fetch_requested ? "STRATA_BATCH_ADAPT_FETCH" : "STRATA_ADAPT_FETCH", off);
             else {
-                drive.d.fetch_admit = adapt_fetch();
+                batch_fetch_active = batch_fetch_requested;
+                drive.d.fetch_admit = batch_fetch_active ? 1 : adapt_fetch();
+                drive.d.fetch_paused = batch_fetch_active;
+                if (batch_fetch_active)
+                    std::fprintf(stderr, "strata serve: STRATA_BATCH_ADAPT_FETCH=1: direct admissions credit the refill budget\n");
                 drive.d.res_mut = host_res.data();
                 drive.d.in_flight.assign(host_res.size(), 0);
                 drive.d.fetch_avail.assign((size_t) g.n_layers, 0);
@@ -14526,8 +14542,16 @@ int main(int argc, char** argv) {
         std::function<void()> adapt_fence;
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        int64_t credited_fetch_admissions = 0;
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            int swap_budget = o.adapt_swaps;
+            if (batch_fetch_active) {
+                // A promotion already paid for by the forward pass is one refill completed.
+                const int64_t new_admissions = drive.d.fetch_admitted - credited_fetch_admissions;
+                swap_budget -= (int) std::min<int64_t>(new_admissions, swap_budget);
+                credited_fetch_admissions = drive.d.fetch_admitted;
+            }
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -14556,7 +14580,7 @@ int main(int argc, char** argv) {
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if ((int) swaps.size() > swap_budget) swaps.resize((size_t) swap_budget);
             if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
                 std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
                 agate.landed.store(-1, std::memory_order_release);
@@ -16316,7 +16340,10 @@ int main(int argc, char** argv) {
                 ver.set_slot_history(rows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
             }
             const Clock::time_point w0 = Clock::now();
-            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+            if (batch_fetch_active) drive.d.fetch_paused = in_prompt_read;
+            const bool ran = ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err);
+            if (batch_fetch_active) drive.d.fetch_paused = true;
+            if (!ran || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
@@ -16534,6 +16561,9 @@ int main(int argc, char** argv) {
                                  (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
+                if (batch_fetch_active)
+                    std::fprintf(stderr, "strata batch: %lld cumulative direct fetch admissions\n",
+                                 (long long) drive.d.fetch_admitted);
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
             return true;
